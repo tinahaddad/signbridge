@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SignBridge – baseline</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --text:#e8eaf0; --muted:#8a90a0; --accent:#4f8cff; --ok:#3ecf8e; --rec:#ff5c5c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 20px; border-bottom:1px solid #262a33; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; margin-right:auto; }
+  main { display:grid; grid-template-columns: minmax(0,1.2fr) minmax(0,1fr); gap:16px; padding:16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border-radius:12px; padding:16px; }
+  h2 { font-size:15px; margin:0 0 10px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; overflow:hidden; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  .pred { font-size:22px; margin:10px 0 4px; min-height:30px; }
+  .pred small { color:var(--muted); font-size:14px; }
+  .sentence, .captions { font-size:26px; line-height:1.35; min-height:70px; background:#0c0e12; padding:12px; border-radius:8px; }
+  .captions .interim { color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0; }
+  button, input, select { font:inherit; padding:8px 12px; border-radius:8px; border:1px solid #333845; background:#222631; color:var(--text); }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.recording { background:var(--rec); border-color:var(--rec); color:#fff; }
+  .labels { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { background:#262a35; border-radius:999px; padding:4px 10px; font-size:13px; }
+  .status { color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🤟 SignBridge <span class="status">baseline</span></h1>
+  <label class="status">Spoken language
+    <select id="lang">
+      <option value="en-US">English</option>
+      <option value="es-ES">Español</option>
+    </select>
+  </label>
+  <span id="status" class="status">Loading hand model…</span>
+</header>
+
+<main>
+  <!-- SIGN → SPEECH -->
+  <section class="panel">
+    <h2>Sign → Speech</h2>
+    <div class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="pred" id="pred">—</div>
+    <div class="sentence" id="sentence"></div>
+    <div class="row">
+      <button id="clearSentence">Clear</button>
+      <button id="speakSentence">Speak sentence</button>
+      <label class="status"><input type="checkbox" id="autoSpeak" checked /> speak each sign</label>
+    </div>
+
+    <h2 style="margin-top:18px">Teach a sign</h2>
+    <div class="row">
+      <input id="labelInput" placeholder="word, e.g. hello" />
+      <button id="recordBtn" class="primary">Hold to record</button>
+    </div>
+    <p class="status">Type a word, make the sign, and hold the button ~3 s while moving slightly. Record 3+ words, plus one called <b>_rest</b> (hands relaxed) so the app knows when you're not signing.</p>
+    <div class="labels" id="labels"></div>
+    <div class="row">
+      <button id="saveData">Save dataset</button>
+      <label><button id="loadBtn">Load dataset</button><input type="file" id="loadData" accept=".json" hidden /></label>
+      <button id="resetData">Reset</button>
+    </div>
+  </section>
+
+  <!-- SPEECH → TEXT -->
+  <section class="panel">
+    <h2>Speech → Captions</h2>
+    <div class="row">
+      <button id="listenBtn" class="primary">Start listening</button>
+      <button id="clearCaptions">Clear</button>
+    </div>
+    <div class="captions" id="captions"></div>
+    <p class="status">Live captions of what the hearing person says, so the signer can read along. Works best in Chrome or Edge.</p>
+  </section>
+</main>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, DrawingUtils }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---------- config ----------
+const K = 5;               // neighbours used by the classifier
+const HOLD_FRAMES = 12;    // frames a sign must be held before it's accepted
+const MIN_CONF = 0.8;      // share of neighbours that must agree
+
+// ---------- elements ----------
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const statusEl = $("status"), predEl = $("pred"), sentenceEl = $("sentence");
+
+// ---------- state ----------
+let samples = [];          // [{label, vec}]
+let recording = false;
+let sentence = [];
+let streak = { label: null, count: 0 };
+let lastCommitted = null;
+
+// ---------- 1. hand tracking ----------
+const vision = await FilesetResolver.forVisionTasks(
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+const hands = await HandLandmarker.createFromOptions(vision, {
+  baseOptions: {
+    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+    delegate: "GPU",
+  },
+  runningMode: "VIDEO",
+  numHands: 2,
+});
+const draw = new DrawingUtils(ctx);
+
+try {
+  video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+  await video.play();
+  statusEl.textContent = "Ready";
+} catch (e) {
+  statusEl.textContent = "Camera blocked: " + e.message;
+}
+
+// ---------- 2. landmarks → feature vector ----------
+// 21 points per hand, made relative to the wrist and scaled,
+// so position in the frame and distance to camera don't matter.
+function normalizeHand(lm) {
+  const w = lm[0];
+  const pts = lm.map(p => [p.x - w.x, p.y - w.y, p.z - w.z]);
+  const scale = Math.max(...pts.map(([x, y, z]) => Math.hypot(x, y, z))) || 1;
+  return pts.flat().map(v => v / scale);
+}
+function toVector(result) {
+  const slots = { Left: new Array(63).fill(0), Right: new Array(63).fill(0) };
+  result.landmarks.forEach((lm, i) => {
+    const side = result.handedness[i]?.[0]?.categoryName || "Right";
+    slots[side] = normalizeHand(lm);
+  });
+  return [...slots.Left, ...slots.Right];
+}
+
+// ---------- 3. classifier (k-nearest neighbours) ----------
+function classify(vec) {
+  if (samples.length < K) return null;
+  const nearest = samples
+    .map(s => ({ label: s.label, d: dist(s.vec, vec) }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, K);
+  const votes = {};
+  nearest.forEach(n => votes[n.label] = (votes[n.label] || 0) + 1);
+  const [label, count] = Object.entries(votes).sort((a, b) => b[1] - a[1])[0];
+  return { label, conf: count / K };
+}
+function dist(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += (a[i] - b[i]) ** 2; return Math.sqrt(s); }
+
+// ---------- 4. main loop ----------
+function loop() {
+  if (video.readyState >= 2) {
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    const result = hands.detectForVideo(video, performance.now());
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (const lm of result.landmarks) {
+      draw.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, { color: "#4f8cff", lineWidth: 3 });
+      draw.drawLandmarks(lm, { color: "#3ecf8e", radius: 3 });
+    }
+
+    if (result.landmarks.length === 0) {
+      predEl.innerHTML = "<small>no hands</small>";
+      streak = { label: null, count: 0 };
+      lastCommitted = null;            // dropping hands lets you repeat a word
+    } else {
+      const vec = toVector(result);
+      if (recording) {
+        const label = $("labelInput").value.trim();
+        if (label) { samples.push({ label, vec }); renderLabels(); }
+      } else {
+        handlePrediction(classify(vec));
+      }
+    }
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---------- 5. turn a stream of predictions into words ----------
+function handlePrediction(p) {
+  if (!p) { predEl.innerHTML = "<small>teach at least one sign</small>"; return; }
+  predEl.innerHTML = `${p.label} <small>${Math.round(p.conf * 100)}%</small>`;
+  if (p.conf < MIN_CONF) { streak = { label: null, count: 0 }; return; }
+  streak = streak.label === p.label ? { label: p.label, count: streak.count + 1 } : { label: p.label, count: 1 };
+
+  if (p.label.startsWith("_")) { lastCommitted = null; return; }   // _rest = pause
+  if (streak.count === HOLD_FRAMES && p.label !== lastCommitted) {
+    lastCommitted = p.label;
+    sentence.push(p.label);
+    sentenceEl.textContent = sentence.join(" ");
+    if ($("autoSpeak").checked) speak(p.label);
+  }
+}
+
+function speak(text) {
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = $("lang").value;
+  speechSynthesis.speak(u);
+}
+
+// ---------- recording / dataset UI ----------
+function renderLabels() {
+  const counts = {};
+  samples.forEach(s => counts[s.label] = (counts[s.label] || 0) + 1);
+  $("labels").innerHTML = Object.entries(counts)
+    .map(([l, c]) => `<span class="chip">${l} · ${c}</span>`).join("");
+}
+const recBtn = $("recordBtn");
+const startRec = e => {
+  e.preventDefault();
+  if (!$("labelInput").value.trim()) { $("labelInput").focus(); return; }
+  recording = true; recBtn.classList.add("recording"); recBtn.textContent = "Recording…";
+};
+const stopRec = () => { recording = false; recBtn.classList.remove("recording"); recBtn.textContent = "Hold to record"; };
+recBtn.addEventListener("mousedown", startRec);
+recBtn.addEventListener("touchstart", startRec);
+["mouseup", "mouseleave", "touchend"].forEach(ev => recBtn.addEventListener(ev, stopRec));
+
+$("clearSentence").onclick = () => { sentence = []; sentenceEl.textContent = ""; };
+$("speakSentence").onclick = () => sentence.length && speak(sentence.join(" "));
+$("resetData").onclick = () => { if (confirm("Delete all recorded samples?")) { samples = []; renderLabels(); } };
+$("saveData").onclick = () => {
+  const blob = new Blob([JSON.stringify(samples)], { type: "application/json" });
+  const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "signs-dataset.json" });
+  a.click();
+};
+$("loadBtn").onclick = () => $("loadData").click();
+$("loadData").onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  samples = JSON.parse(await file.text()); renderLabels();
+};
+
+// ---------- 6. speech → captions ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, listening = false, finalText = "";
+const listenBtn = $("listenBtn");
+if (!SR) { listenBtn.disabled = true; listenBtn.textContent = "Speech recognition not supported in this browser"; }
+
+listenBtn.onclick = () => {
+  if (listening) { listening = false; rec.stop(); listenBtn.textContent = "Start listening"; return; }
+  rec = new SR();
+  rec.continuous = true; rec.interimResults = true; rec.lang = $("lang").value;
+  rec.onresult = e => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += t.trim() + ". "; else interim += t;
+    }
+    $("captions").innerHTML = `${finalText}<span class="interim">${interim}</span>`;
+  };
+  rec.onend = () => { if (listening) rec.start(); };   // keep listening after pauses
+  rec.start(); listening = true; listenBtn.textContent = "Stop listening";
+};
+$("clearCaptions").onclick = () => { finalText = ""; $("captions").innerHTML = ""; };
+</script>
+</body>
+</html>
